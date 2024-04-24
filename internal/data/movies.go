@@ -1,11 +1,13 @@
 package data
 
 import (
-	"time"
 	"damir/internal/validator"
 	"database/sql"
-	"github.com/lib/pq"
 	"errors"
+	"time"
+	"fmt" 
+	"context"
+	"github.com/lib/pq"
 )
 
 type Movie struct{
@@ -29,8 +31,10 @@ func (m MovieModel) Insert(movie *Movie) error {
 		RETURNING id, created_at, version`
 	
 	args := []any{movie.Title, movie.Year, movie.Runtime, pq.Array(movie.Genres)}
-	return m.DB.QueryRow(query, args...).Scan(&movie.ID, &movie.CreatedAt, &movie.Version)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return m.DB.QueryRowContext(ctx, query, args...).Scan(&movie.ID, &movie.CreatedAt, &movie.Version)
+}
 
 func (m MovieModel) Get(id int64) (*Movie, error) {
 	query := `
@@ -38,7 +42,12 @@ func (m MovieModel) Get(id int64) (*Movie, error) {
 		FROM movies
 		WHERE id = $1`
 	var movie Movie
-	err := m.DB.QueryRow(query, id).Scan(
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+	defer cancel()
+
+	err := m.DB.QueryRowContext(ctx, query, id).Scan(
 		&movie.ID,
 		&movie.CreatedAt,
 		&movie.Title,
@@ -72,14 +81,31 @@ func (m MovieModel) Update(movie *Movie) error {
 		pq.Array(movie.Genres),
 		movie.ID,
 	}
-	return m.DB.QueryRow(query, args...).Scan(&movie.Version)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := m.DB.QueryRowContext(ctx, query, args...).Scan(&movie.Version)
+
+	if err != nil{
+		switch{
+			case errors.Is(err, sql.ErrNoRows):
+				return ErrEditConflict
+			default:
+				return err
+		}
+	}
+	return nil
 }
 
 func (m MovieModel) Delete(id int64) error {
 	query := `
 	DELETE FROM movies
 	WHERE id = $1`
-	result, err := m.DB.Exec(query, id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := m.DB.ExecContext(ctx, query, id)	
 	if err != nil {
 		return err
 	}
@@ -91,6 +117,60 @@ func (m MovieModel) Delete(id int64) error {
 		return ErrRecordNotFound
 	}
 	return nil
+}
+
+
+func (m MovieModel) GetAll(title string, genres []string, filters Filters) ([]*Movie, Metadata, error) {
+	// Construct the SQL query to retrieve all movie records.
+	query := fmt.Sprintf(`
+	SELECT count(*) OVER(), id, created_at, title, year, runtime, genres, version
+	FROM movies
+	WHERE (to_tsvector('simple', title) @@ plainto_tsquery('simple', $1) OR $1 = '')
+	AND (genres @> $2 OR $2 = '{}')
+	ORDER BY %s %s, id ASC
+	LIMIT $3 OFFSET $4`, filters.sortColumn(), filters.sortDirection())
+	// Create a context with a 3-second timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	args := []any{title, pq.Array(genres), filters.limit(), filters.offset()}
+	// Use QueryContext() to execute the query. This returns a sql.Rows resultset
+	// containing the result.
+	rows, err := m.DB.QueryContext(ctx, query, args...)	
+	if err != nil {
+		return nil, Metadata{}, err // Update this to return an empty Metadata struct.
+	}
+	defer rows.Close()
+	// Initialize an empty slice to hold the movie data.
+	movies := []*Movie{}
+	// Use rows.Next to iterate through the rows in the resultset.
+	// Declare a totalRecords variable.
+	totalRecords := 0
+
+	for rows.Next() {
+	// Initialize an empty Movie struct to hold the data for an individual movie.
+	var movie Movie
+	// Scan the values from the row into the Movie struct. Again, note that we're
+	// using the pq.Array() adapter on the genres field here.
+	err := rows.Scan(
+	&totalRecords,
+	&movie.ID,
+	&movie.CreatedAt,
+	&movie.Title,
+	&movie.Year,
+	&movie.Runtime,
+	pq.Array(&movie.Genres),
+	&movie.Version,
+	)
+	if err != nil {
+		return nil, Metadata{}, err
+	}
+	movies = append(movies, &movie)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, Metadata{}, err
+	}
+	metadata := calculateMetadata(totalRecords, filters.Page, filters.PageSize)
+	return movies, metadata, nil
 }
 
 func ValidateMovie(v *validator.Validator, movie *Movie) {
